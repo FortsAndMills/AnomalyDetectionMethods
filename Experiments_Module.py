@@ -1,6 +1,8 @@
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics.pairwise import pairwise_distances as dist_matrix
 from scipy.linalg import qr
+from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pandas as pd
 import math
@@ -49,6 +51,43 @@ class modIsolationForest:  # строим много модифицирован�
         for tree in self.trees:
             ans += tree.decision_function(x)
         return ans / len(self.trees)
+
+class PolinomSolver:
+    def __init__(self, metric='chebyshev', n_jobs=-1):
+        self.metric = metric
+        self.n_jobs = n_jobs
+
+    def fit(self, X):
+        self.scal = StandardScaler().fit(X)
+        self.X = self.scal.transform(X)
+        return self
+
+    def decision_function(self, New_X):
+        DM = dist_matrix(self.scal.transform(New_X), self.X, n_jobs=self.n_jobs, metric=self.metric)
+        ans = (DM ** 0.01).prod(axis=1)
+        return -ans
+
+class BaggingPolynomSolver:
+    def __init__(self, metric='chebyshev', n_jobs=-1, n_estimators=10, max_samples=250):
+        self.metric = metric
+        self.n_jobs = n_jobs
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+
+    def fit(self, X):
+        self.scal = StandardScaler().fit(X)
+        self.X = self.scal.transform(X)
+        return self
+
+    def decision_function(self, New_X):
+        tr_new_X = self.scal.transform(New_X)
+
+        ans = np.zeros((len(New_X)))
+        for i in range(self.n_estimators):
+            indexes = np.random.choice(len(self.X), self.max_samples)
+            DM = dist_matrix(tr_new_X, self.X[indexes], n_jobs=self.n_jobs, metric=self.metric)
+            ans += (DM ** 0.01).prod(axis=1)
+        return -ans / self.n_estimators
 
 
 # In[4]:
@@ -103,7 +142,7 @@ def aucroc(y_pred_test, y_pred_outliers):
 
 def Solve(clf, train, test_normalities, test_outliers):
     clf.fit(train)
-    y_pred_train = clf.decision_function(train)
+    #y_pred_train = clf.decision_function(train)
     y_pred_test = clf.decision_function(test_normalities)
     y_pred_outliers = clf.decision_function(test_outliers)
         
@@ -168,15 +207,17 @@ def draw_with_thresholds(thresholds, normals_clusters, all_points):
 # In[9]:
 
 # получаем номера кластеров, которые для данных разбиение объявляются нормалиями
-def get_normals_clusters(n_of_cluster, thresholds):
+def get_normals_clusters(n_of_cluster, thresholds, limit=-1):
     normals_clusters = set()
     for i in np.argsort(np.bincount(n_of_cluster))[::-1]:
+        if limit > 0 and len(normals_clusters) >= limit:
+            break
         if i - 1 in normals_clusters or i + 1 in normals_clusters:
             break
         normals_clusters.add(i)
     return normals_clusters
 
-def apply_threshold(normal, anomaly, n_of_splits, verbose=True):
+def apply_threshold(normal, anomaly, n_of_splits, limit=-1, verbose=True):
     all_points = np.append(normal, anomaly)  # множество всех точек
     sorted_data = np.sort(all_points)  # отсортированные точки
     differences = sorted_data[1:] - sorted_data[:-1]    # множество расстояний между соседними
@@ -186,34 +227,41 @@ def apply_threshold(normal, anomaly, n_of_splits, verbose=True):
     # номер группы для каждой точки
     n_of_cluster = np.array([all_points > threshold for threshold in thresholds]).sum(axis=0)
     # множество кластеров нормалий
-    normals_clusters = get_normals_clusters(n_of_cluster, thresholds)
+    normals_clusters = get_normals_clusters(n_of_cluster, thresholds, limit)
     # максимальный размер кластера аномалий, T
     T = np.sort(np.bincount(n_of_cluster))[::-1][len(normals_clusters)]
+    # отношение T к минимальному размеру кластера нормалий
+    T_frac = T / np.sort(np.bincount(n_of_cluster))[::-1][len(normals_clusters) - 1]
     # предсказание (1 - аномалия, 0 - нормалия)
     f = np.array([not n in normals_clusters for n in n_of_cluster])
+    # доля аномалий в предсказании
+    Anom_frac = f.sum() / len(sorted_data)
     
     if verbose:
         print("T = ", T)
-        print("Anomalies Fraction = ", f.sum() / len(sorted_data), "%")
+        print("T_frac = ", T_frac)
+        print("Anomalies Fraction = ", Anom_frac, "%")
         draw_with_thresholds(thresholds, normals_clusters, sorted_data)
         return f
         
-    return T, f.sum() / len(sorted_data), len(normals_clusters)
+    return T, T_frac, Anom_frac, len(normals_clusters)
 
 
 # In[10]:
 
-def analize_threshold(normal, anomaly, limit_steps=-1):
+def analize_threshold(normal, anomaly, limit_steps=-1, limit_normal_clusters=-1):
     T_dynamics = []
+    T_frac_dynamics = []
     AnomFraction_dynamics = []
     N_of_normalies_clusters = []
     
     if limit_steps == -1:
         limit_steps = len(normal) + len(anomaly) - 1
     for n_of_splits in range(1, limit_steps):
-        T, anom_frac, N_of_norm = apply_threshold(normal, anomaly, n_of_splits, False)
+        T, T_frac, anom_frac, N_of_norm = apply_threshold(normal, anomaly, n_of_splits, limit_normal_clusters, False)
         
         T_dynamics.append(T)
+        T_frac_dynamics.append(T_frac)
         AnomFraction_dynamics.append(anom_frac)
         N_of_normalies_clusters.append(N_of_norm)
         
@@ -221,39 +269,47 @@ def analize_threshold(normal, anomaly, limit_steps=-1):
     differences = all_data[1:] - all_data[:-1]
 
     fig = plt.figure(figsize=(16, 14))
-    ax = fig.add_subplot(411)
+    ax = fig.add_subplot(511)
     ax.plot(np.sort(differences)[::-1])
     ax.legend(['Differences descending'])
     #plt.axvline(x = 15, lw=3, c='black')
-    ax = fig.add_subplot(412)
+    ax = fig.add_subplot(512)
     ax.plot(T_dynamics, color='m')
-    ax.legend(['T'])
+    ax.legend(['Size of biggest anomaly cluster (T)'])
     #plt.axvline(x = 15, lw=3, c='black')
-    ax = fig.add_subplot(413)
+    ax = fig.add_subplot(513)
+    ax.plot(T_frac_dynamics, color='black')
+    ax.legend(['T / size of smalles normaly cluster'])
+    # plt.axvline(x = 15, lw=3, c='black')
+    ax = fig.add_subplot(514)
     ax.plot(AnomFraction_dynamics, color='red')
     ax.legend(['Fraction of anomalies in forecast'])
     #plt.axvline(x = 15, lw=3, c='black')
-    ax = fig.add_subplot(414)
+    ax = fig.add_subplot(515)
     ax.plot(N_of_normalies_clusters, color='green')
     ax.legend(['Number of normalies clusters'])
     #plt.axvline(x = 15, lw=3, c='black')
     plt.show(fig)
 
-def submit_variants(normal, anomaly, max_anom_frac):
+def submit_variants(normal, anomaly, max_anom_frac, max_T_frac):
     T_dynamics = []
+    T_frac_dynamics = []
     AnomFraction_dynamics = []
     N_of_normalies_clusters = []
 
     for n_of_splits in range(1, len(normal) + len(anomaly) - 1):
-        T, anom_frac, N_of_norm = apply_threshold(normal, anomaly, n_of_splits, False)
+        T, T_frac, anom_frac, N_of_norm = apply_threshold(normal, anomaly, n_of_splits, 1, False)
 
-        if n_of_splits > 1 and AnomFraction_dynamics[-1] <= max_anom_frac:
-            if anom_frac > max_anom_frac and N_of_normalies_clusters[-1] == 1:
-                print("bound variant: n_splits=", n_of_splits - 1, "T = ", T_dynamics[-1], ", anom_frac = ", AnomFraction_dynamics[-1])
-            elif N_of_norm > 1 and N_of_normalies_clusters[-1] == 1:
-                print("variant: n_splits=", n_of_splits - 1, "T = ", T_dynamics[-1], ", anom_frac = ", AnomFraction_dynamics[-1])
+        if n_of_splits > 1 and AnomFraction_dynamics[-1] <= max_anom_frac and T_frac_dynamics[-1] <= max_T_frac and N_of_normalies_clusters[-1] == 1:
+            if anom_frac > max_anom_frac:
+                print("bound variant: n_splits=", n_of_splits - 1, "T = ", T_dynamics[-1], "T_frac = ", T_frac_dynamics[-1], ", anom_frac = ", AnomFraction_dynamics[-1])
+            elif N_of_norm > 1:
+                print("variant: n_splits=", n_of_splits - 1, "T = ", T_dynamics[-1], "T_frac = ", T_frac_dynamics[-1], ", anom_frac = ", AnomFraction_dynamics[-1])
+            elif T_frac > max_T_frac:
+                print("T-variant: n_splits=", n_of_splits - 1, "T = ", T_dynamics[-1], "T_frac = ", T_frac_dynamics[-1], ", anom_frac = ", AnomFraction_dynamics[-1])
 
         T_dynamics.append(T)
+        T_frac_dynamics.append(T_frac)
         AnomFraction_dynamics.append(anom_frac)
         N_of_normalies_clusters.append(N_of_norm)
 
